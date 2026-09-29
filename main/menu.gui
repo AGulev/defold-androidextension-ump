@@ -29,11 +29,15 @@ nodes {
 nodes {
   position {
     x: 360.0
-    y: 527.59186
+    y: 560.0
+  }
+  scale {
+    x: 0.65
+    y: 0.65
   }
   size {
-    x: 500.0
-    y: 100.0
+    x: 760.0
+    y: 260.0
   }
   type: TYPE_TEXT
   text: "Push A Button!"
@@ -144,9 +148,13 @@ nodes {
     x: 360.0
     y: 407.59186
   }
+  scale {
+    x: 0.65
+    y: 0.65
+  }
   size {
-    x: 500.0
-    y: 100.0
+    x: 760.0
+    y: 180.0
   }
   type: TYPE_TEXT
   font: "cool"

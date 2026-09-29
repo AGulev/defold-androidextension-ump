@@ -1,13 +1,13 @@
-// Extension lib defines
 #define EXTENSION_NAME ump
 #define LIB_NAME "ump"
 #define MODULE_NAME LIB_NAME
-
-// Defold SDK
 #define DLIB_LOG_DOMAIN LIB_NAME
 #include <dmsdk/sdk.h>
 
 #if defined(DM_PLATFORM_ANDROID)
+#include <dmsdk/dlib/android.h>
+#include <stdlib.h>
+#include <string.h>
 
 enum Operation { REQUEST_CONSENT = 1, PRIVACY_OPTIONS = 2, CONSENT_INFO_UPDATE = 3 };
 
@@ -15,6 +15,8 @@ struct Completion {
     int m_Operation;
     int m_Id;
     bool m_Success;
+    int m_ErrorCode;
+    char* m_ErrorMessage;
 };
 
 static dmMutex::HMutex g_Mutex;
@@ -27,23 +29,47 @@ static dmScript::LuaCallbackInfo* g_RequestCallback = 0;
 static dmScript::LuaCallbackInfo* g_InfoCallback = 0;
 static dmScript::LuaCallbackInfo* g_PrivacyCallback = 0;
 
-extern "C" JNIEXPORT void JNICALL Java_com_defold_umpext_UMPExtension_onNativeCompletion(
-        JNIEnv* env, jclass cls, jint operation, jint id, jboolean success)
+static void ClearCallback(dmScript::LuaCallbackInfo*& callback)
 {
+    if (callback) dmScript::DestroyCallback(callback);
+    callback = 0;
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_defold_umpext_UMPExtension_onNativeCompletion(
+        JNIEnv* env, jclass cls, jint operation, jint id, jboolean success, jint errorCode, jstring errorMessage)
+{
+    Completion completion = {(int)operation, (int)id, success == JNI_TRUE, (int)errorCode, 0};
+    if (errorMessage) {
+        const char* chars = env->GetStringUTFChars(errorMessage, 0);
+        if (!chars) return;
+        completion.m_ErrorMessage = strdup(chars);
+        env->ReleaseStringUTFChars(errorMessage, chars);
+    }
     DM_MUTEX_SCOPED_LOCK(g_Mutex);
-    if (!g_AcceptCompletions) return;
+    if (!g_AcceptCompletions) {
+        free(completion.m_ErrorMessage);
+        return;
+    }
     if (g_Completions.Full()) g_Completions.OffsetCapacity(4);
-    Completion completion = {(int)operation, (int)id, success == JNI_TRUE};
     g_Completions.Push(completion);
 }
 
-static void InvokeCompletion(dmScript::LuaCallbackInfo* callback, bool success)
+static void InvokeCompletion(dmScript::LuaCallbackInfo* callback, const Completion& completion)
 {
     if (!callback) return;
     if (dmScript::IsCallbackValid(callback) && dmScript::SetupCallback(callback)) {
         lua_State* L = dmScript::GetCallbackLuaContext(callback);
-        lua_pushboolean(L, success);
-        dmScript::PCall(L, 2, 0);
+        lua_pushboolean(L, completion.m_Success);
+        if (completion.m_Success) {
+            lua_pushnil(L);
+        } else {
+            lua_createtable(L, 0, 2);
+            lua_pushinteger(L, completion.m_ErrorCode);
+            lua_setfield(L, -2, "code");
+            lua_pushstring(L, completion.m_ErrorMessage ? completion.m_ErrorMessage : "UMP operation failed");
+            lua_setfield(L, -2, "message");
+        }
+        dmScript::PCall(L, 3, 0);
         dmScript::TeardownCallback(callback);
     }
     dmScript::DestroyCallback(callback);
@@ -69,8 +95,9 @@ static dmExtension::Result UpdateExtension(dmExtension::Params* params)
         if (slot) {
             dmScript::LuaCallbackInfo* callback = *slot;
             *slot = 0;
-            InvokeCompletion(callback, completion.m_Success);
+            InvokeCompletion(callback, completion);
         }
+        free(completion.m_ErrorMessage);
     }
     return dmExtension::RESULT_OK;
 }
@@ -88,283 +115,284 @@ enum UmpConstant {
     GDPR_APPLIES_UNKNOWN = -1,
     GDPR_APPLIES_NO = 0,
     GDPR_APPLIES_YES = 1,
+    ERROR_BRIDGE = -1,
 };
 
-static JNIEnv* Attach()
+enum JavaMethod {
+    JAVA_REQUEST_CONSENT_INFO_UPDATE,
+    JAVA_SHOW_CONSENT_FORM_IF_REQUIRED,
+    JAVA_SHOW_PRIVACY_OPTIONS_FORM,
+    JAVA_IS_PRIVACY_OPTIONS_REQUIRED,
+    JAVA_CAN_REQUEST_ADS,
+    JAVA_RESET_CONSENT_INFORMATION,
+    JAVA_GET_CONSENT_STATUS,
+    JAVA_GET_REQUEST_STATE,
+    JAVA_WAS_CONSENT_FORM_REQUIRED,
+    JAVA_GET_PRIVACY_OPTIONS_STATE,
+    JAVA_GET_GDPR_APPLIES,
+    JAVA_GET_PURPOSE_CONSENTS,
+    JAVA_METHOD_COUNT,
+};
+
+struct JavaBinding {
+    const char* m_Name;
+    const char* m_Signature;
+    jmethodID m_Method;
+};
+
+static jclass g_JavaClass = 0;
+static JavaBinding g_JavaMethods[] = {
+    {"requestConsentInfoUpdate", "(Landroid/app/Activity;ZLjava/lang/String;IZ)Z", 0},
+    {"showConsentFormIfRequired", "(Landroid/app/Activity;I)Z", 0},
+    {"showPrivacyOptionsForm", "(Landroid/app/Activity;I)Z", 0},
+    {"isPrivacyOptionsRequired", "()Z", 0},
+    {"canRequestAds", "()Z", 0},
+    {"resetConsentInformation", "()Z", 0},
+    {"getConsentStatus", "()I", 0},
+    {"getRequestState", "()I", 0},
+    {"wasConsentFormRequired", "()Z", 0},
+    {"getPrivacyOptionsState", "()I", 0},
+    {"getGdprApplies", "(Landroid/app/Activity;)I", 0},
+    {"getPurposeConsents", "(Landroid/app/Activity;)Ljava/lang/String;", 0},
+};
+static_assert(sizeof(g_JavaMethods) / sizeof(g_JavaMethods[0]) == JAVA_METHOD_COUNT, "Missing Java binding");
+
+static bool CheckJavaException(JNIEnv* env, const char* operation)
 {
-    JNIEnv* env;
-    JavaVM* vm = dmGraphics::GetNativeAndroidJavaVM();
-    vm->AttachCurrentThread(&env, NULL);
-    return env;
+    if (!env) {
+        dmLogError("Cannot attach to Java for %s", operation);
+        return false;
+    }
+    if (env->ExceptionCheck()) {
+        dmLogError("Java call failed: %s", operation);
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        return false;
+    }
+    return true;
 }
 
-static bool Detach(JNIEnv* env)
+static void ReleaseJavaBindings(JNIEnv* env)
 {
-    bool exception = (bool) env->ExceptionCheck();
-    env->ExceptionClear();
-    JavaVM* vm = dmGraphics::GetNativeAndroidJavaVM();
-    vm->DetachCurrentThread();
-    return !exception;
+    if (g_JavaClass && env) env->DeleteGlobalRef(g_JavaClass);
+    g_JavaClass = 0;
+    for (int i = 0; i < JAVA_METHOD_COUNT; ++i) g_JavaMethods[i].m_Method = 0;
 }
 
-namespace {
-    struct AttachScope
-    {
-        JNIEnv* m_Env;
-        AttachScope() : m_Env(Attach())
-        {
-        }
-        ~AttachScope()
-        {
-            Detach(m_Env);
-        }
-    };
-}
-
-static jclass GetClass(JNIEnv* env, const char* classname)
+static bool CacheJavaBindings(JNIEnv* env)
 {
-    jclass activity_class = env->FindClass("android/app/NativeActivity");
-    jmethodID get_class_loader = env->GetMethodID(activity_class, "getClassLoader", "()Ljava/lang/ClassLoader;");
-    jobject cls = env->CallObjectMethod(dmGraphics::GetNativeAndroidActivity(), get_class_loader);
-    jclass class_loader = env->FindClass("java/lang/ClassLoader");
-    jmethodID find_class = env->GetMethodID(class_loader, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
-
-    jstring str_class_name = env->NewStringUTF(classname);
-    jclass outcls = (jclass)env->CallObjectMethod(cls, find_class, str_class_name);
-    env->DeleteLocalRef(str_class_name);
-    return outcls;
+    if (!CheckJavaException(env, "UMP initialization")) return false;
+    // LoadClass uses local references internally; release all of them together.
+    if (env->PushLocalFrame(8) < 0) {
+        CheckJavaException(env, "UMP class loader");
+        return false;
+    }
+    jclass cls = dmAndroid::LoadClass(env, "com.defold.umpext.UMPExtension");
+    bool ok = CheckJavaException(env, "UMP class loader") && cls;
+    if (ok) {
+        g_JavaClass = (jclass)env->NewGlobalRef(cls);
+        ok = CheckJavaException(env, "UMP class reference") && g_JavaClass;
+    }
+    for (int i = 0; ok && i < JAVA_METHOD_COUNT; ++i) {
+        JavaBinding& binding = g_JavaMethods[i];
+        binding.m_Method = env->GetStaticMethodID(g_JavaClass, binding.m_Name, binding.m_Signature);
+        ok = CheckJavaException(env, binding.m_Name) && binding.m_Method;
+    }
+    env->PopLocalFrame(0);
+    if (!ok) ReleaseJavaBindings(env);
+    return ok;
 }
 
-// Request consent info update
+static bool JavaReady(JNIEnv* env, JavaMethod method)
+{
+    return CheckJavaException(env, g_JavaMethods[method].m_Name)
+        && g_JavaClass && g_JavaMethods[method].m_Method;
+}
+
+static bool CallJavaBoolean(JavaMethod method, const jvalue* args, bool& value)
+{
+    dmAndroid::ThreadAttacher thread;
+    JNIEnv* env = thread.GetEnv();
+    if (!JavaReady(env, method)) return false;
+    jboolean result = env->CallStaticBooleanMethodA(g_JavaClass, g_JavaMethods[method].m_Method, args);
+    if (!CheckJavaException(env, g_JavaMethods[method].m_Name)) return false;
+    value = result == JNI_TRUE;
+    return true;
+}
+
+static bool CallJavaInt(JavaMethod method, const jvalue* args, int& value)
+{
+    dmAndroid::ThreadAttacher thread;
+    JNIEnv* env = thread.GetEnv();
+    if (!JavaReady(env, method)) return false;
+    jint result = env->CallStaticIntMethodA(g_JavaClass, g_JavaMethods[method].m_Method, args);
+    if (!CheckJavaException(env, g_JavaMethods[method].m_Name)) return false;
+    value = result;
+    return true;
+}
+
+static bool StartJavaRequest(bool testDevice, const char* testDeviceId, int id, bool deferForm, bool& accepted)
+{
+    dmAndroid::ThreadAttacher thread;
+    JNIEnv* env = thread.GetEnv();
+    if (!JavaReady(env, JAVA_REQUEST_CONSENT_INFO_UPDATE)) return false;
+    jstring deviceId = env->NewStringUTF(testDeviceId);
+    if (!CheckJavaException(env, "test device ID") || !deviceId) return false;
+    jvalue args[5] = {};
+    args[0].l = dmGraphics::GetNativeAndroidActivity();
+    args[1].z = testDevice ? JNI_TRUE : JNI_FALSE;
+    args[2].l = deviceId;
+    args[3].i = id;
+    args[4].z = deferForm ? JNI_TRUE : JNI_FALSE;
+    jboolean result = env->CallStaticBooleanMethodA(g_JavaClass,
+            g_JavaMethods[JAVA_REQUEST_CONSENT_INFO_UPDATE].m_Method, args);
+    env->DeleteLocalRef(deviceId);
+    if (!CheckJavaException(env, "requestConsentInfoUpdate")) return false;
+    accepted = result == JNI_TRUE;
+    return true;
+}
+
+static int PushJavaBoolean(lua_State* L, JavaMethod method)
+{
+    DM_LUA_STACK_CHECK(L, 1);
+    bool value;
+    if (!CallJavaBoolean(method, 0, value)) return luaL_error(L, "UMP Java call failed: %s", g_JavaMethods[method].m_Name);
+    lua_pushboolean(L, value);
+    return 1;
+}
+
+static int PushJavaInt(lua_State* L, JavaMethod method, const jvalue* args = 0)
+{
+    DM_LUA_STACK_CHECK(L, 1);
+    int value;
+    if (!CallJavaInt(method, args, value)) return luaL_error(L, "UMP Java call failed: %s", g_JavaMethods[method].m_Name);
+    lua_pushinteger(L, value);
+    return 1;
+}
+
 static int RequestConsentInfoUpdate(lua_State* L)
 {
     DM_LUA_STACK_CHECK(L, 0);
+    luaL_checktype(L, 1, LUA_TBOOLEAN);
     const char* testDeviceId = luaL_checkstring(L, 2);
     if (!lua_isnoneornil(L, 3)) luaL_checktype(L, 3, LUA_TFUNCTION);
     if (!lua_isnoneornil(L, 4)) luaL_checktype(L, 4, LUA_TBOOLEAN);
     bool deferForm = lua_toboolean(L, 4);
-    if (g_RequestCallback) dmScript::DestroyCallback(g_RequestCallback);
-    if (g_InfoCallback) dmScript::DestroyCallback(g_InfoCallback);
-    g_RequestCallback = 0;
-    g_InfoCallback = 0;
+    int id = ++g_NextId;
+    bool accepted;
+    if (!StartJavaRequest(lua_toboolean(L, 1), testDeviceId, id, deferForm, accepted)) {
+        return luaL_error(L, "UMP Java call failed: requestConsentInfoUpdate");
+    }
+    if (!accepted) return luaL_error(L, "A UMP form is already loading or showing");
+    // A rejected request must leave the active operation and its callback intact.
+    ClearCallback(g_RequestCallback);
+    ClearCallback(g_InfoCallback);
+    g_RequestId = id;
     dmScript::LuaCallbackInfo* callback = lua_isnoneornil(L, 3) ? 0 : dmScript::CreateCallback(L, 3);
     if (deferForm) g_InfoCallback = callback;
     else g_RequestCallback = callback;
-    g_RequestId = ++g_NextId;
-    AttachScope attachscope;
-    JNIEnv* env = attachscope.m_Env;
-
-    jclass cls = GetClass(env, "com.defold.umpext.UMPExtension");
-    jmethodID method = env->GetStaticMethodID(cls, "requestConsentInfoUpdate", "(Landroid/app/Activity;ZLjava/lang/String;IZ)V");
-
-    jobject activity = dmGraphics::GetNativeAndroidActivity();
-    bool testDevice = lua_toboolean(L, 1);
-    jstring jtestDeviceId = env->NewStringUTF(testDeviceId);
-    env->CallStaticVoidMethod(cls, method, activity, testDevice, jtestDeviceId, g_RequestId, deferForm);
-    env->DeleteLocalRef(jtestDeviceId);
-
     return 0;
 }
 
-// Continue a successfully updated request after the game's privacy notice closes.
+static int StartJavaForm(lua_State* L, JavaMethod method, int id)
+{
+    jvalue args[2] = {};
+    args[0].l = dmGraphics::GetNativeAndroidActivity();
+    args[1].i = id;
+    bool accepted;
+    if (!CallJavaBoolean(method, args, accepted)) return luaL_error(L, "UMP Java call failed: %s", g_JavaMethods[method].m_Name);
+    if (!accepted) return luaL_error(L, "Consent information must finish updating and any active UMP form must close first");
+    return 0;
+}
+
 static int ShowConsentFormIfRequired(lua_State* L)
 {
     DM_LUA_STACK_CHECK(L, 0);
     if (!lua_isnoneornil(L, 1)) luaL_checktype(L, 1, LUA_TFUNCTION);
-    bool formPending;
-    {
-        AttachScope attachscope;
-        JNIEnv* env = attachscope.m_Env;
-        jclass cls = GetClass(env, "com.defold.umpext.UMPExtension");
-        jmethodID method = env->GetStaticMethodID(cls, "getRequestState", "()I");
-        formPending = env->CallStaticIntMethod(cls, method) == REQUEST_STATE_FORM_PENDING;
-    }
-    if (g_InfoCallback || g_RequestCallback || !formPending) {
+    if (g_InfoCallback || g_RequestCallback) {
         return luaL_error(L, "Consent information must finish updating before showing a form");
     }
-    AttachScope attachscope;
-    JNIEnv* env = attachscope.m_Env;
-    jclass cls = GetClass(env, "com.defold.umpext.UMPExtension");
+    StartJavaForm(L, JAVA_SHOW_CONSENT_FORM_IF_REQUIRED, g_RequestId);
     g_RequestCallback = lua_isnoneornil(L, 1) ? 0 : dmScript::CreateCallback(L, 1);
-    jmethodID method = env->GetStaticMethodID(cls, "showConsentFormIfRequired", "(Landroid/app/Activity;I)V");
-    env->CallStaticVoidMethod(cls, method, dmGraphics::GetNativeAndroidActivity(), g_RequestId);
     return 0;
 }
 
-// Show privacy options form
 static int ShowPrivacyOptionsForm(lua_State* L)
 {
     DM_LUA_STACK_CHECK(L, 0);
     if (!lua_isnoneornil(L, 1)) luaL_checktype(L, 1, LUA_TFUNCTION);
-    if (g_PrivacyCallback) dmScript::DestroyCallback(g_PrivacyCallback);
+    int id = ++g_NextId;
+    StartJavaForm(L, JAVA_SHOW_PRIVACY_OPTIONS_FORM, id);
+    ClearCallback(g_PrivacyCallback);
+    g_PrivacyId = id;
     g_PrivacyCallback = lua_isnoneornil(L, 1) ? 0 : dmScript::CreateCallback(L, 1);
-    g_PrivacyId = ++g_NextId;
-    AttachScope attachscope;
-    JNIEnv* env = attachscope.m_Env;
-
-    jclass cls = GetClass(env, "com.defold.umpext.UMPExtension");
-    jmethodID method = env->GetStaticMethodID(cls, "showPrivacyOptionsForm", "(Landroid/app/Activity;I)V");
-
-    jobject activity = dmGraphics::GetNativeAndroidActivity();
-    env->CallStaticVoidMethod(cls, method, activity, g_PrivacyId);
-
     return 0;
 }
 
-// Check if privacy options are required
-static int IsPrivacyOptionsRequired(lua_State* L)
-{
-    DM_LUA_STACK_CHECK(L, 1);
-    AttachScope attachscope;
-    JNIEnv* env = attachscope.m_Env;
+static int IsPrivacyOptionsRequired(lua_State* L) { return PushJavaBoolean(L, JAVA_IS_PRIVACY_OPTIONS_REQUIRED); }
+static int CanRequestAds(lua_State* L) { return PushJavaBoolean(L, JAVA_CAN_REQUEST_ADS); }
+static int GetConsentStatus(lua_State* L) { return PushJavaInt(L, JAVA_GET_CONSENT_STATUS); }
+static int GetRequestState(lua_State* L) { return PushJavaInt(L, JAVA_GET_REQUEST_STATE); }
+static int WasConsentFormRequired(lua_State* L) { return PushJavaBoolean(L, JAVA_WAS_CONSENT_FORM_REQUIRED); }
+static int GetPrivacyOptionsState(lua_State* L) { return PushJavaInt(L, JAVA_GET_PRIVACY_OPTIONS_STATE); }
 
-    jclass cls = GetClass(env, "com.defold.umpext.UMPExtension");
-    jmethodID method = env->GetStaticMethodID(cls, "isPrivacyOptionsRequired", "()Z");
-
-    jboolean isRequired = env->CallStaticBooleanMethod(cls, method);
-    lua_pushboolean(L, isRequired);
-
-    return 1;
-}
-
-// Can request ads
-static int CanRequestAds(lua_State* L)
-{
-    DM_LUA_STACK_CHECK(L, 1);
-    AttachScope attachscope;
-    JNIEnv* env = attachscope.m_Env;
-
-    jclass cls = GetClass(env, "com.defold.umpext.UMPExtension");
-    jmethodID method = env->GetStaticMethodID(cls, "canRequestAds", "()Z");
-
-    jboolean canRequestAds = env->CallStaticBooleanMethod(cls, method);
-    lua_pushboolean(L, canRequestAds);
-
-    return 1;
-}
-
-// Initialize Mobile Ads SDK
-static int InitializeMobileAdsSdk(lua_State* L)
-{
-    DM_LUA_STACK_CHECK(L, 0);
-    AttachScope attachscope;
-    JNIEnv* env = attachscope.m_Env;
-
-    jclass cls = GetClass(env, "com.defold.umpext.UMPExtension");
-    jmethodID method = env->GetStaticMethodID(cls, "initializeMobileAdsSdk", "(Landroid/content/Context;)V");
-
-    jobject context = dmGraphics::GetNativeAndroidActivity();
-    env->CallStaticVoidMethod(cls, method, context);
-
-    return 0;
-}
-
-// Reset consent information
 static int ResetConsentInformation(lua_State* L)
 {
     DM_LUA_STACK_CHECK(L, 0);
-    AttachScope attachscope;
-    JNIEnv* env = attachscope.m_Env;
-
-    jclass cls = GetClass(env, "com.defold.umpext.UMPExtension");
-    jmethodID method = env->GetStaticMethodID(cls, "resetConsentInformation", "()V");
-
-    env->CallStaticVoidMethod(cls, method);
-
+    bool accepted;
+    if (!CallJavaBoolean(JAVA_RESET_CONSENT_INFORMATION, 0, accepted)) return luaL_error(L, "UMP Java call failed: resetConsentInformation");
+    if (!accepted) return luaL_error(L, "A UMP form must close before resetting consent information");
+    ClearCallback(g_RequestCallback);
+    ClearCallback(g_InfoCallback);
+    ClearCallback(g_PrivacyCallback);
+    g_RequestId = 0;
+    g_PrivacyId = 0;
     return 0;
-}
-
-// Lua function to get consent status
-static int GetConsentStatus(lua_State* L) {
-    DM_LUA_STACK_CHECK(L, 1);
-    AttachScope attachscope;
-    JNIEnv* env = attachscope.m_Env;
-
-    jclass cls = GetClass(env, "com.defold.umpext.UMPExtension");
-    jmethodID method = env->GetStaticMethodID(cls, "getConsentStatus", "()I");
-
-    jint consentStatus = env->CallStaticIntMethod(cls, method);
-    lua_pushinteger(L, consentStatus);
-
-    return 1;
-}
-
-
-static int GetRequestState(lua_State* L)
-{
-    DM_LUA_STACK_CHECK(L, 1);
-    AttachScope attachscope;
-    JNIEnv* env = attachscope.m_Env;
-    jclass cls = GetClass(env, "com.defold.umpext.UMPExtension");
-    jmethodID method = env->GetStaticMethodID(cls, "getRequestState", "()I");
-    lua_pushinteger(L, env->CallStaticIntMethod(cls, method));
-    return 1;
-}
-
-static int WasConsentFormRequired(lua_State* L)
-{
-    DM_LUA_STACK_CHECK(L, 1);
-    AttachScope attachscope;
-    JNIEnv* env = attachscope.m_Env;
-    jclass cls = GetClass(env, "com.defold.umpext.UMPExtension");
-    jmethodID method = env->GetStaticMethodID(cls, "wasConsentFormRequired", "()Z");
-    lua_pushboolean(L, env->CallStaticBooleanMethod(cls, method));
-    return 1;
-}
-
-static int GetPrivacyOptionsState(lua_State* L)
-{
-    DM_LUA_STACK_CHECK(L, 1);
-    AttachScope attachscope;
-    JNIEnv* env = attachscope.m_Env;
-    jclass cls = GetClass(env, "com.defold.umpext.UMPExtension");
-    jmethodID method = env->GetStaticMethodID(cls, "getPrivacyOptionsState", "()I");
-    lua_pushinteger(L, env->CallStaticIntMethod(cls, method));
-    return 1;
 }
 
 static int GetGdprApplies(lua_State* L)
 {
-    DM_LUA_STACK_CHECK(L, 1);
-    AttachScope attachscope;
-    JNIEnv* env = attachscope.m_Env;
-    jclass cls = GetClass(env, "com.defold.umpext.UMPExtension");
-    jobject activity = dmGraphics::GetNativeAndroidActivity();
-    jmethodID method = env->GetStaticMethodID(cls, "getGdprApplies", "(Landroid/app/Activity;)I");
-    lua_pushinteger(L, env->CallStaticIntMethod(cls, method, activity));
-    return 1;
+    jvalue args[1] = {};
+    args[0].l = dmGraphics::GetNativeAndroidActivity();
+    return PushJavaInt(L, JAVA_GET_GDPR_APPLIES, args);
+}
+
+static bool PushPurposeConsents(lua_State* L)
+{
+    dmAndroid::ThreadAttacher thread;
+    JNIEnv* env = thread.GetEnv();
+    if (!JavaReady(env, JAVA_GET_PURPOSE_CONSENTS)) return false;
+    jstring value = (jstring)env->CallStaticObjectMethod(g_JavaClass,
+            g_JavaMethods[JAVA_GET_PURPOSE_CONSENTS].m_Method, dmGraphics::GetNativeAndroidActivity());
+    if (!CheckJavaException(env, "getPurposeConsents")) return false;
+    if (!value) {
+        lua_pushnil(L);
+        return true;
+    }
+    const char* chars = env->GetStringUTFChars(value, 0);
+    bool ok = CheckJavaException(env, "purpose consents string") && chars;
+    if (ok) {
+        lua_pushstring(L, chars);
+        env->ReleaseStringUTFChars(value, chars);
+    }
+    env->DeleteLocalRef(value);
+    return ok;
 }
 
 static int GetPurposeConsents(lua_State* L)
 {
     DM_LUA_STACK_CHECK(L, 1);
-    AttachScope attachscope;
-    JNIEnv* env = attachscope.m_Env;
-    jclass cls = GetClass(env, "com.defold.umpext.UMPExtension");
-    jobject activity = dmGraphics::GetNativeAndroidActivity();
-    jmethodID method = env->GetStaticMethodID(cls, "getPurposeConsents", "(Landroid/app/Activity;)Ljava/lang/String;");
-    jstring value = (jstring)env->CallStaticObjectMethod(cls, method, activity);
-    if (value) {
-        const char* chars = env->GetStringUTFChars(value, NULL);
-        lua_pushstring(L, chars);
-        env->ReleaseStringUTFChars(value, chars);
-        env->DeleteLocalRef(value);
-    } else {
-        lua_pushnil(L);
-    }
+    if (!PushPurposeConsents(L)) return luaL_error(L, "UMP Java call failed: getPurposeConsents");
     return 1;
 }
 
-// Functions exposed to Lua
-static const luaL_reg Module_methods[] =
-{
+static const luaL_reg Module_methods[] = {
     {"request_consent_info_update", RequestConsentInfoUpdate},
     {"show_consent_form_if_required", ShowConsentFormIfRequired},
     {"show_privacy_options_form", ShowPrivacyOptionsForm},
     {"is_privacy_options_required", IsPrivacyOptionsRequired},
     {"can_request_ads", CanRequestAds},
-    {"initialize_mobile_ads_sdk", InitializeMobileAdsSdk},
-    {"get_consent_status", GetConsentStatus},  // <-- New function
+    {"get_consent_status", GetConsentStatus},
     {"get_request_state", GetRequestState},
     {"was_consent_form_required", WasConsentFormRequired},
     {"get_privacy_options_state", GetPrivacyOptionsState},
@@ -377,10 +405,7 @@ static const luaL_reg Module_methods[] =
 static void LuaInit(lua_State* L)
 {
     int top = lua_gettop(L);
-
-    // Register lua names
     luaL_register(L, MODULE_NAME, Module_methods);
-
     #define SETCONSTANT(name) lua_pushinteger(L, name); lua_setfield(L, -2, #name);
     SETCONSTANT(REQUEST_STATE_UPDATING)
     SETCONSTANT(REQUEST_STATE_COMPLETE)
@@ -393,8 +418,8 @@ static void LuaInit(lua_State* L)
     SETCONSTANT(GDPR_APPLIES_UNKNOWN)
     SETCONSTANT(GDPR_APPLIES_NO)
     SETCONSTANT(GDPR_APPLIES_YES)
+    SETCONSTANT(ERROR_BRIDGE)
     #undef SETCONSTANT
-
     lua_pop(L, 1);
     assert(top == lua_gettop(L));
 }
@@ -408,12 +433,15 @@ static dmExtension::Result InitializeExtension(dmExtension::Params* params)
 {
     if (!g_Mutex) g_Mutex = dmMutex::New();
     {
+        dmAndroid::ThreadAttacher thread;
+        if (!CacheJavaBindings(thread.GetEnv())) return dmExtension::RESULT_INIT_ERROR;
+    }
+    {
         DM_MUTEX_SCOPED_LOCK(g_Mutex);
         g_AcceptCompletions = true;
     }
-    // Init Lua
     LuaInit(params->m_L);
-    printf("Registered %s Extension\n", MODULE_NAME);
+    dmLogInfo("Registered %s Extension", MODULE_NAME);
     return dmExtension::RESULT_OK;
 }
 
@@ -427,14 +455,16 @@ static dmExtension::Result FinalizeExtension(dmExtension::Params* params)
     {
         DM_MUTEX_SCOPED_LOCK(g_Mutex);
         g_AcceptCompletions = false;
+        for (uint32_t i = 0; i < g_Completions.Size(); ++i) free(g_Completions[i].m_ErrorMessage);
         g_Completions.SetSize(0);
     }
-    if (g_RequestCallback) dmScript::DestroyCallback(g_RequestCallback);
-    if (g_InfoCallback) dmScript::DestroyCallback(g_InfoCallback);
-    if (g_PrivacyCallback) dmScript::DestroyCallback(g_PrivacyCallback);
-    g_RequestCallback = 0;
-    g_InfoCallback = 0;
-    g_PrivacyCallback = 0;
+    ClearCallback(g_RequestCallback);
+    ClearCallback(g_InfoCallback);
+    ClearCallback(g_PrivacyCallback);
+    g_RequestId = 0;
+    g_PrivacyId = 0;
+    dmAndroid::ThreadAttacher thread;
+    ReleaseJavaBindings(thread.GetEnv());
     return dmExtension::RESULT_OK;
 }
 
@@ -442,24 +472,13 @@ static dmExtension::Result FinalizeExtension(dmExtension::Params* params)
 
 static dmExtension::Result AppInitializeExtension(dmExtension::AppParams* params)
 {
-    dmLogWarning("Registered %s (null) Extension\n", MODULE_NAME);
+    dmLogWarning("Registered %s (null) Extension", MODULE_NAME);
     return dmExtension::RESULT_OK;
 }
 
-static dmExtension::Result InitializeExtension(dmExtension::Params* params)
-{
-    return dmExtension::RESULT_OK;
-}
-
-static dmExtension::Result AppFinalizeExtension(dmExtension::AppParams* params)
-{
-    return dmExtension::RESULT_OK;
-}
-
-static dmExtension::Result FinalizeExtension(dmExtension::Params* params)
-{
-    return dmExtension::RESULT_OK;
-}
+static dmExtension::Result InitializeExtension(dmExtension::Params* params) { return dmExtension::RESULT_OK; }
+static dmExtension::Result AppFinalizeExtension(dmExtension::AppParams* params) { return dmExtension::RESULT_OK; }
+static dmExtension::Result FinalizeExtension(dmExtension::Params* params) { return dmExtension::RESULT_OK; }
 
 #endif
 

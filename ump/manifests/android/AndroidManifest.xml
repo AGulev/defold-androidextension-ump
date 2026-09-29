@@ -1,19 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-          xmlns:tools="http://schemas.android.com/tools"
-          package="{{android.package}}">    
+          package="{{android.package}}">
     <application>
-
-        <!-- if extension-admob is not loaded, uncomment this bit to use UMP on its own 
+        {{#ump.app_id_android}}
         <meta-data
             android:name="com.google.android.gms.ads.APPLICATION_ID"
-            android:value="" tools:node="remove"/>
-        <meta-data
-            android:name="com.google.android.gms.ads.flag.OPTIMIZE_INITIALIZATION"
-            android:value="true" tools:node="remove"/>
-        <meta-data
-            android:name="com.google.android.gms.ads.flag.OPTIMIZE_AD_LOADING"
-            android:value="true" tools:node="remove"/>-->
-
+            android:value="{{ump.app_id_android}}" />
+        {{/ump.app_id_android}}
     </application>
 </manifest>

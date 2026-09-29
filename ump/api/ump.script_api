@@ -11,6 +11,8 @@
         deferred mode the callback runs after the information update, before any
         form opens; call show_consent_form_if_required to finish the flow.
         A successful callback means no UMP error, not consent to personalized ads.
+        Raises a Lua error if a consent or privacy-options form is active, without
+        replacing that form's callback. Pending information updates may be superseded.
       parameters:
         - name: test_device
           type: boolean
@@ -21,7 +23,7 @@
         - name: callback
           type: function
           optional: true
-          desc: Called when the update and any required form finish.
+          desc: Called when the update and any required form finish, or after the information update in deferred mode.
           parameters:
             - name: self
               type: object
@@ -29,6 +31,10 @@
             - name: success
               type: boolean
               desc: False if the consent information update or form failed.
+            - name: error
+              type: table
+              optional: true
+              desc: Nil on success; otherwise a table with code (UMP error code or ump.ERROR_BRIDGE) and message.
         - name: defer_form
           type: boolean
           optional: true
@@ -51,6 +57,7 @@
         notice first. Call only once, after that notice has closed. The callback
         runs after the required form closes or fails, or immediately if no form
         is required. Advertising must wait for this callback.
+        Raises a Lua error if the update is unfinished or a form is active.
       parameters:
         - name: callback
           type: function
@@ -63,6 +70,10 @@
             - name: success
               type: boolean
               desc: False if the form could not be loaded or shown.
+            - name: error
+              type: table
+              optional: true
+              desc: Nil on success; otherwise a table with code (UMP error code or ump.ERROR_BRIDGE) and message.
 
     - name: show_privacy_options_form
       type: function
@@ -70,6 +81,9 @@
         Open the UMP privacy-options form in response to user input. Check
         is_privacy_options_required() first. A successful callback means the form
         closed without an error, not that the user granted consent.
+        Wait until the current consent flow finishes. Raises a Lua error if an
+        update or form step is unfinished or either form is active, preserving
+        the active callback.
       parameters:
         - name: callback
           type: function
@@ -82,6 +96,10 @@
             - name: success
               type: boolean
               desc: False if the form could not be shown or completed.
+            - name: error
+              type: table
+              optional: true
+              desc: Nil on success; otherwise a table with code (UMP error code or ump.ERROR_BRIDGE) and message.
       examples:
         - desc: |-
             ```lua
@@ -175,16 +193,9 @@
     - name: reset_consent_information
       type: function
       desc: |-
-        Clear UMP consent information for testing if its object has been created.
-        Start a new request afterward. Diagnostic request/form states are not
-        reset by this call.
-
-    - name: initialize_mobile_ads_sdk
-      type: function
-      desc: |-
-        Legacy, nonfunctional export. Its required Java method is absent from
-        this extension. Do not call it. If using the Defold AdMob extension,
-        call admob.initialize() after the UMP flow instead.
+        Clear UMP consent information for testing, reset diagnostic state and
+        cancel pending callbacks and deferred resumes. Start a new update afterward.
+        Raises a Lua error while either form is active.
 
     - name: REQUEST_STATE_UPDATING
       type: number
@@ -219,3 +230,6 @@
     - name: GDPR_APPLIES_YES
       type: number
       desc: "1; IAB TCF value says GDPR applies."
+    - name: ERROR_BRIDGE
+      type: number
+      desc: "-1; callback error code for an unexpected Java exception. UMP failures retain their SDK error codes."

@@ -6,6 +6,13 @@ local function set_text_consent(text)
     gui.set_text(gui.get_node("consent"), "UMP says: \n" .. text)
 end
 
+local function format_error(err)
+    print("UMP error:", err.code, err.message)
+    local message = err.message:match("^[^\n]*"):gsub("%s+", " ")
+    if #message > 160 then message = message:sub(1, 157) .. "..." end
+    return "(" .. err.code .. "): " .. message
+end
+
 local function show_consent_result()
     set_text(ump.can_request_ads() and "Ads can be requested." or "Ads cannot be requested.")
     set_text_consent(ump.is_privacy_options_required()
@@ -13,37 +20,38 @@ local function show_consent_result()
 end
 
 local function request_consent(self)
-    if self.request_pending then return end
+    if self.request_pending or self.privacy_pending then return end
     self.request_pending = true
     self.request_complete = false
     set_text("Requesting consent information...")
     set_text_consent("Waiting for UMP...")
-    -- Register a real test-device hash and set this to true when testing an EEA form.
-    ump.request_consent_info_update(false, "", function(_, success)
+    local test_device = sys.get_config_int("ump.test_device", 0) == 1
+    local test_device_hash = sys.get_config_string("ump.test_device_hashed_id", "")
+    ump.request_consent_info_update(test_device, test_device_hash, function(_, success, err)
         self.request_pending = false
         if success then
             self.request_complete = true
             show_consent_result()
         else
-            set_text("Consent update or form failed.")
+            set_text("Consent failed " .. format_error(err))
             set_text_consent("Ads were not requested.")
         end
     end)
 end
 
 local function show_privacy_options(self)
+    if self.request_pending or self.privacy_pending then return end
     if not self.request_complete or not ump.is_privacy_options_required() then
         set_text_consent("Privacy choices are not available yet.")
         return
     end
-    if self.privacy_pending then return end
     self.privacy_pending = true
-    ump.show_privacy_options_form(function(_, success)
+    ump.show_privacy_options_form(function(_, success, err)
         self.privacy_pending = false
         if success then
             show_consent_result()
         else
-            set_text_consent("Could not show privacy choices.")
+            set_text_consent("Privacy choices failed " .. format_error(err))
         end
     end)
 end

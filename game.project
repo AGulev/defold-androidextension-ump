@@ -30,14 +30,14 @@ bundle_identifier = com.defold.umpext
 package = com.defold.umpext
 manifest = /builtins/manifests/android/AndroidManifest.xml
 minimum_sdk_version = 23
+r8_keep_rules = /builtins/manifests/android/dmengine.keep
 
 [graphics]
 default_texture_min_filter = linear
 default_texture_mag_filter = linear
 
 [ump]
-app_id_android = ca-app-pub-3940256099942544~1458002511
+app_id_android = ca-app-pub-3940256099942544~3347511713
 
 [library]
 include_dirs = ump
-

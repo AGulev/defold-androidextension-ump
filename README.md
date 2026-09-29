@@ -5,7 +5,7 @@ This native extension wraps the Google User Messaging Platform (UMP) SDK on Andr
 ## Setup
 
 1. Add this extension to your Defold project's dependencies and fetch libraries. It bundles UMP SDK 4.0.0. [Google's Android setup guide](https://developers.google.com/admob/android/privacy) lists Android API 21 as the minimum for UMP 4.0.0; this repository's example project targets API 23.
-2. Configure an **AdMob application ID** in the Android manifest. The [Defold AdMob extension](https://github.com/defold/extension-admob) can supply it through `[admob] app_id_android` in `game.project`. AdMob is not required by the UMP bridge itself; if you do not use that extension, add the `com.google.android.gms.ads.APPLICATION_ID` manifest metadata yourself. The `[ump] app_id_android` value in this repository's example `game.project` is not read by the bridge or its manifest.
+2. Configure an **AdMob application ID** through `[ump] app_id_android` in `game.project`; this extension adds it to the Android manifest. If the [Defold AdMob extension](https://github.com/defold/extension-admob) already supplies the ID through `[admob] app_id_android`, you can omit the UMP setting. When both settings are present, use the same ID. AdMob is not required by the UMP bridge itself.
 3. Create and publish a message in AdMob **Privacy & messaging** for that application ID. Without a configured message, UMP cannot show the corresponding consent form.
 4. On Defold 1.13.2 or newer, select `/builtins/manifests/android/dmengine.keep` under **Android → R8 Keep Rules** in `game.project`. This extension also supplies `ump/manifests/android/ump.keep` for its JNI bridge.
 
@@ -26,9 +26,9 @@ Call `ump.request_consent_info_update()` on **every launch**. Its callback runs 
 function init(self)
     if not ump then return end
 
-    ump.request_consent_info_update(false, "", function(self, success)
+    ump.request_consent_info_update(false, "", function(self, success, err)
         if not success then
-            print("UMP update or form failed")
+            print("UMP update or form failed:", err.code, err.message)
             return
         end
 
@@ -43,11 +43,11 @@ end
 -- Call this from a user-pressed privacy/settings button when it is available.
 local function open_privacy_choices()
     if not ump or not ump.is_privacy_options_required() then return end
-    ump.show_privacy_options_form(function(self, success)
+    ump.show_privacy_options_form(function(self, success, err)
         if success then
             print("Privacy options closed; ads allowed:", ump.can_request_ads())
         else
-            print("Privacy options could not be shown or completed")
+            print("Privacy options failed:", err.code, err.message)
         end
     end)
 end
@@ -92,13 +92,17 @@ ad eligibility. Wait for the form callback before requesting ads. Omitting
 
 ## Lua API
 
-Completion callbacks are optional. If omitted, the state getters remain available for diagnostics, but callbacks are the intended way to know when a request or form finishes. A newer call of the same kind supersedes an earlier callback.
+Completion callbacks are optional and have the signature `callback(self, success, error)`. The third argument is `nil` on success, or a table with `code` and `message` on failure. UMP failures retain Google's error code and message; an unexpected Java exception uses `ERROR_BRIDGE`. Existing callbacks that accept only `self, success` continue to work. If a callback is omitted, state getters remain available for diagnostics.
+
+A newer information update supersedes a pending update or a deferred flow that has not started its form. While either form is reserved, loading or showing, another update, form call or reset raises a Lua error and preserves the active callback. Privacy options also wait until the consent update and form step finish. A rejected call does not run its supplied callback. Disable the corresponding UI button until the active callback finishes.
+
+JNI classes and method signatures are checked when the extension initializes. A synchronous JNI failure raises a Lua error and is logged on Android; it is not reported as a successful consent result.
 
 | Function | Result and behavior |
 | --- | --- |
-| `ump.request_consent_info_update(test_device, test_device_hashed_id, callback, defer_form)` | Starts an update and shows the consent form if required. `test_device` is a boolean. `test_device_hashed_id` is a required string; pass `""` when test mode is off. With test mode on, the device hash is registered and UMP debug geography is forced to EEA. Optional `callback(self, success)` receives `false` if the update or form fails. Optional `defer_form=true` pauses before the form and calls back after the information update instead; it defaults to `false`. |
-| `ump.show_consent_form_if_required(callback)` | Continues a successful deferred update. Call once after any application notice closes. Optional `callback(self, success)` runs after the required form closes or fails, or immediately if none is required. |
-| `ump.show_privacy_options_form(callback)` | Opens privacy options. Call from a user action after `is_privacy_options_required()` returns true. Optional `callback(self, success)` receives `false` if the form cannot be shown or completed. |
+| `ump.request_consent_info_update(test_device, test_device_hashed_id, callback, defer_form)` | Starts an update and shows the consent form if required. `test_device` is a boolean. `test_device_hashed_id` is a required string; pass `""` when test mode is off. With test mode on, the device hash is registered and UMP debug geography is forced to EEA. Optional `callback(self, success, error)` receives `false` and error details if the update or form fails. Optional `defer_form=true` pauses before the form and calls back after the information update instead; it defaults to `false`. Raises a Lua error if a form is active. |
+| `ump.show_consent_form_if_required(callback)` | Continues a successful deferred update. Call once after any application notice closes. Optional `callback(self, success, error)` runs after the required form closes or fails, or without opening a form if none is required. Raises a Lua error if the update is unfinished or a form is active. |
+| `ump.show_privacy_options_form(callback)` | Opens privacy options. Call from a user action after the current consent flow finishes and `is_privacy_options_required()` returns true. Optional `callback(self, success, error)` receives `false` and error details if the form cannot be shown or completed. Raises a Lua error if the consent flow is unfinished or a form is active. |
 | `ump.is_privacy_options_required()` | Returns `true` if UMP requires a privacy-options entry point. Returns `false` before consent information has been obtained. |
 | `ump.can_request_ads()` | Returns UMP's ad-request eligibility. Check it after the current request callback; it may reflect an earlier session while an update is running. |
 | `ump.get_consent_status()` | Returns UMP's numeric consent status: `0` unknown, `1` not required, `2` required, `3` obtained; returns `-1` before the consent-information object exists. Status `3` does not specify whether ads may be personalized. |
@@ -107,8 +111,9 @@ Completion callbacks are optional. If omitted, the state getters remain availabl
 | `ump.get_privacy_options_state()` | Returns the state of the latest privacy-options form. See constants below. |
 | `ump.get_gdpr_applies()` | Reads the `IABTCF_gdprApplies` value written to Android default preferences. Returns `GDPR_APPLIES_UNKNOWN` if absent or invalid. Read it after a successful update; it is a GDPR applicability signal, not a country code or vendor consent. |
 | `ump.get_purpose_consents()` | Reads the raw `IABTCF_PurposeConsents` bit string from Android default preferences after a successful update or privacy-options callback. Returns `nil` if unavailable. The third character represents TCF Purpose 3 consent; this value does not establish vendor consent by itself. |
-| `ump.reset_consent_information()` | Clears UMP consent information **for testing** if the consent-information object has been created. Start a new update afterward; the extension's diagnostic state getters are not reset by this call. |
-| `ump.initialize_mobile_ads_sdk()` | **Nonfunctional legacy export.** The native bridge calls a Java method absent from this extension. Do not call it; use `admob.initialize()` after consent if you use the AdMob extension. |
+| `ump.reset_consent_information()` | Clears UMP consent information **for testing**, resets diagnostic state and cancels pending callbacks/deferred resumes. Start a new update afterward. Raises a Lua error while a form is active. |
+
+The broken legacy `ump.initialize_mobile_ads_sdk()` export has been removed. Use `admob.initialize()` after consent when using the AdMob extension.
 
 ### Constants
 
@@ -127,6 +132,7 @@ The following numbers are exported as fields of `ump`. Request states and privac
 | `GDPR_APPLIES_UNKNOWN` | `-1` | Applicability value is absent or invalid. |
 | `GDPR_APPLIES_NO` | `0` | TCF value says GDPR does not apply. |
 | `GDPR_APPLIES_YES` | `1` | TCF value says GDPR applies. |
+| `ERROR_BRIDGE` | `-1` | Callback error code for an unexpected Java exception. UMP failures retain their SDK error codes. |
 
 The full Defold editor API reference is in [`ump/api/ump.script_api`](ump/api/ump.script_api).
 
@@ -135,5 +141,11 @@ The full Defold editor API reference is in [`ump/api/ump.script_api`](ump/api/um
 Run `python3 tests/test_consent_flow.py` with Python, Java and `javac` available.
 It runs the production Java flow with SDK test doubles and a recorded JNI
 completion callback. It checks deferred/automatic presentation, skipped forms,
-failures, repeated resumes, superseded requests and privacy-options callbacks.
+error details, overlapping forms, UI-thread dispatch, superseded queued work,
+concurrent state transitions, reset behavior and privacy-options callbacks.
 Use an Android build/device to validate the real SDK and JNI integration.
+
+The example reads `[ump] test_device = 1` and `test_device_hashed_id` from
+`game.project` to force EEA geography for testing. Emulators are test devices
+automatically, so their hash can be empty. Keep test mode off in released apps.
+These settings belong to the example script, not the extension API.
